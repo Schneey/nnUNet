@@ -51,7 +51,7 @@ except ImportError:
 
 class nnUNetTrainer(NetworkTrainer):
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, fp16=False):
+                 unpack_data=True, deterministic=True, fp16=False,net=None):
         """
         :param deterministic:
         :param fold: can be either [0 ... 5) for cross-validation, 'all' to train on all available training data or
@@ -333,9 +333,11 @@ class nnUNetTrainer(NetworkTrainer):
         self.plans = plans
 
         stage_plans = self.plans['plans_per_stage'][self.stage]
-        self.batch_size = stage_plans['batch_size']
+        #self.batch_size = stage_plans['batch_size']
+        self.batch_size = 1
         self.net_pool_per_axis = stage_plans['num_pool_per_axis']
-        self.patch_size = np.array(stage_plans['patch_size']).astype(int)
+        self.patch_size = np.array(stage_plans['patch_size']).astype(int)   #array([ 56, 160, 192])
+        #self.patch_size = np.array([ 40, 128, 160])
         self.do_dummy_2D_aug = stage_plans['do_dummy_2D_data_aug']
         self.net_num_pool_op_kernel_sizes = stage_plans['pool_op_kernel_sizes']
         self.net_conv_kernel_sizes = stage_plans['conv_kernel_sizes']

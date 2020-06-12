@@ -22,6 +22,8 @@ from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
 from nnunet.training.data_augmentation.default_data_augmentation import get_moreDA_augmentation
 from nnunet.network_architecture.generic_UNet import Generic_UNet
+from nnunet.network_architecture.nas_UNet import Nas_UNet
+from nnunet.network_architecture.architect import Architect
 from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
 from nnunet.training.data_augmentation.default_data_augmentation import default_2D_augmentation_params, \
@@ -46,13 +48,14 @@ class nnUNetTrainerV2(nnUNetTrainer):
     """
 
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, fp16=False):
+                 unpack_data=True, deterministic=True, fp16=False,net=None):
         super().__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
-                         deterministic, fp16)
-        self.max_num_epochs = 1000
+                         deterministic, fp16,net)
+        self.max_num_epochs = 1500
         self.initial_lr = 1e-2
         self.deep_supervision_scales = None
         self.ds_loss_weights = None
+        self.net=net
 
         self.pin_memory = True
 
@@ -154,12 +157,29 @@ class nnUNetTrainerV2(nnUNetTrainer):
         dropout_op_kwargs = {'p': 0, 'inplace': True}
         net_nonlin = nn.LeakyReLU
         net_nonlin_kwargs = {'negative_slope': 1e-2, 'inplace': True}
-        self.network = Generic_UNet(self.num_input_channels, self.base_num_features, self.num_classes,
-                                    len(self.net_num_pool_op_kernel_sizes),
-                                    self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
-                                    dropout_op_kwargs,
-                                    net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
-                                    self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
+        if self.net=='3d_nas':
+            self.network=Nas_UNet(4,4,self.num_input_channels, self.base_num_features, self.num_classes,
+                                        len(self.net_num_pool_op_kernel_sizes),
+                                        self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
+                                        dropout_op_kwargs,
+                                        net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
+                                        self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
+            self.architect = Architect(self.network, self.loss)
+        elif self.net=='3d_nas_2C':
+            self.network=Nas_UNet(2,2,self.num_input_channels, self.base_num_features, self.num_classes,
+                                        len(self.net_num_pool_op_kernel_sizes),
+                                        self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
+                                        dropout_op_kwargs,
+                                        net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
+                                        self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
+            self.architect = Architect(self.network, self.loss)
+        else:
+            self.network = Generic_UNet(self.num_input_channels, self.base_num_features, self.num_classes,
+                                        len(self.net_num_pool_op_kernel_sizes),
+                                        self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
+                                        dropout_op_kwargs,
+                                        net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
+                                        self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
         if torch.cuda.is_available():
             self.network.cuda()
         self.network.inference_apply_nonlin = softmax_helper
@@ -246,6 +266,54 @@ class nnUNetTrainerV2(nnUNetTrainer):
         if run_online_evaluation:
             self.run_online_evaluation(output, target)
         del target
+
+        if do_backprop:
+            if not self.fp16 or amp is None or not torch.cuda.is_available():
+                loss.backward()
+            else:
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            _ = clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
+
+        return loss.detach().cpu().numpy()
+     
+    def run_iteration_nas(self,tr_data_generator, val_data_generator,do_backprop=True, run_online_evaluation=False):
+        
+        tr_data_dict = next(tr_data_generator)
+        tr_data = tr_data_dict['data']
+        tr_target = tr_data_dict['target']
+        
+        val_data_dict = next(val_data_generator)
+        val_data = val_data_dict['data']
+        val_target = val_data_dict['target']
+
+        tr_data = maybe_to_torch(tr_data)
+        tr_target = maybe_to_torch(tr_target)
+        val_data = maybe_to_torch(val_data)
+        val_target = maybe_to_torch(val_target)
+
+        if torch.cuda.is_available():
+            tr_data = to_cuda(tr_data)
+            tr_target = to_cuda(tr_target)
+            val_target = to_cuda(val_target)
+            val_data = to_cuda(val_data)
+            #val_target = Variable(val_target, requires_grad=False).cuda()
+
+        self.architect.step(tr_data, tr_target, val_data, val_target, self.lr, self.optimizer,unrolled=False)
+        del val_data 
+        del val_target
+
+        self.optimizer.zero_grad()
+
+        output = self.network(tr_data)
+
+        del tr_data 
+        loss = self.loss(output, tr_target)
+
+        if run_online_evaluation:
+            self.run_online_evaluation(output, tr_target)
+        del tr_target
 
         if do_backprop:
             if not self.fp16 or amp is None or not torch.cuda.is_available():
@@ -350,6 +418,7 @@ class nnUNetTrainerV2(nnUNetTrainer):
         else:
             ep = epoch
         self.optimizer.param_groups[0]['lr'] = poly_lr(ep, self.max_num_epochs, self.initial_lr, 0.9)
+        self.lr=self.optimizer.param_groups[0]['lr']
         self.print_to_log_file("lr:", np.round(self.optimizer.param_groups[0]['lr'], decimals=6))
 
     def on_epoch_end(self):

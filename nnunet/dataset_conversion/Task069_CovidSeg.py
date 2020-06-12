@@ -6,7 +6,7 @@ from nnunet.paths import nnUNet_raw_data
 
 if __name__ == '__main__':
     #data is available at http://medicalsegmentation.com/covid19/
-    download_dir = '/home/fabian/Downloads'
+    download_dir = '/mnt/disk_8t/xyz/COVID-19-CT-100slice'
 
     task_id = 69
     task_name = "CovidSeg"

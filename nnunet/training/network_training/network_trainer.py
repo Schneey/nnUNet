@@ -15,7 +15,7 @@
 
 from _warnings import warn
 from typing import Tuple
-
+import torch.nn.functional as F
 import matplotlib
 from batchgenerators.utilities.file_and_folder_operations import *
 from nnunet.network_architecture.neural_network import SegmentationNetwork
@@ -427,6 +427,10 @@ class NetworkTrainer(object):
             self.print_to_log_file("\nepoch: ", self.epoch)
             epoch_start_time = time()
             train_losses_epoch = []
+            genotype = self.network.genotype()
+            print('genotype = ', genotype)
+            print(F.softmax(self.network.alphas_normal, dim=-1))
+            print(F.softmax(self.network.alphas_reduce, dim=-1))
 
             # train one epoch
             self.network.train()
@@ -435,14 +439,18 @@ class NetworkTrainer(object):
                 with trange(self.num_batches_per_epoch) as tbar:
                     for b in tbar:
                         tbar.set_description("Epoch {}/{}".format(self.epoch+1, self.max_num_epochs))
-
-                        l = self.run_iteration(self.tr_gen, True)
-
+                        if self.net=='3d_nas' or self.net=='3d_nas_2C':
+                            l = self.run_iteration_nas(self.tr_gen, self.val_gen,True)
+                        else:
+                            l = self.run_iteration(self.tr_gen, True)
                         tbar.set_postfix(loss=l)
                         train_losses_epoch.append(l)
             else:
                 for _ in range(self.num_batches_per_epoch):
-                    l = self.run_iteration(self.tr_gen, True)
+                    if self.net=='3d_nas' or self.net=='3d_nas_2C':
+                        l = self.run_iteration_nas(self.tr_gen, self.val_gen,True)
+                    else:
+                        l = self.run_iteration(self.tr_gen, True)
                     train_losses_epoch.append(l)
 
             self.all_tr_losses.append(np.mean(train_losses_epoch))
@@ -647,6 +655,9 @@ class NetworkTrainer(object):
 
         return l.detach().cpu().numpy()
 
+    def run_iteration_nas(self,tr_data_generator, val_data_generator,do_backprop=True, run_online_evaluation=False):
+        pass
+
     def run_online_evaluation(self, *args, **kwargs):
         """
         Can be implemented, does not have to
@@ -667,54 +678,54 @@ class NetworkTrainer(object):
     def validate(self, *args, **kwargs):
         pass
 
-    def find_lr(self, num_iters=1000, init_value=1e-6, final_value=10., beta=0.98):
-        """
-        stolen and adapted from here: https://sgugger.github.io/how-do-you-find-a-good-learning-rate.html
-        :param num_iters:
-        :param init_value:
-        :param final_value:
-        :param beta:
-        :return:
-        """
-        import math
-        self._maybe_init_amp()
-        mult = (final_value / init_value) ** (1 / num_iters)
-        lr = init_value
-        self.optimizer.param_groups[0]['lr'] = lr
-        avg_loss = 0.
-        best_loss = 0.
-        losses = []
-        log_lrs = []
+    # def find_lr(self, num_iters=1000, init_value=1e-6, final_value=10., beta=0.98):
+    #     """
+    #     stolen and adapted from here: https://sgugger.github.io/how-do-you-find-a-good-learning-rate.html
+    #     :param num_iters:
+    #     :param init_value:
+    #     :param final_value:
+    #     :param beta:
+    #     :return:
+    #     """
+    #     import math
+    #     self._maybe_init_amp()
+    #     mult = (final_value / init_value) ** (1 / num_iters)
+    #     lr = init_value
+    #     self.optimizer.param_groups[0]['lr'] = lr
+    #     avg_loss = 0.
+    #     best_loss = 0.
+    #     losses = []
+    #     log_lrs = []
 
-        for batch_num in range(1, num_iters + 1):
-            # +1 because this one here is not designed to have negative loss...
-            loss = self.run_iteration(self.tr_gen, do_backprop=True, run_online_evaluation=False).data.item() + 1
+    #     for batch_num in range(1, num_iters + 1):
+    #         # +1 because this one here is not designed to have negative loss...
+    #         loss = self.run_iteration(self.tr_gen, do_backprop=True, run_online_evaluation=False).data.item() + 1
 
-            # Compute the smoothed loss
-            avg_loss = beta * avg_loss + (1 - beta) * loss
-            smoothed_loss = avg_loss / (1 - beta ** batch_num)
+    #         # Compute the smoothed loss
+    #         avg_loss = beta * avg_loss + (1 - beta) * loss
+    #         smoothed_loss = avg_loss / (1 - beta ** batch_num)
 
-            # Stop if the loss is exploding
-            if batch_num > 1 and smoothed_loss > 4 * best_loss:
-                break
+    #         # Stop if the loss is exploding
+    #         if batch_num > 1 and smoothed_loss > 4 * best_loss:
+    #             break
 
-            # Record the best loss
-            if smoothed_loss < best_loss or batch_num == 1:
-                best_loss = smoothed_loss
+    #         # Record the best loss
+    #         if smoothed_loss < best_loss or batch_num == 1:
+    #             best_loss = smoothed_loss
 
-            # Store the values
-            losses.append(smoothed_loss)
-            log_lrs.append(math.log10(lr))
+    #         # Store the values
+    #         losses.append(smoothed_loss)
+    #         log_lrs.append(math.log10(lr))
 
-            # Update the lr for the next step
-            lr *= mult
-            self.optimizer.param_groups[0]['lr'] = lr
+    #         # Update the lr for the next step
+    #         lr *= mult
+    #         self.optimizer.param_groups[0]['lr'] = lr
 
-        import matplotlib.pyplot as plt
-        lrs = [10 ** i for i in log_lrs]
-        fig = plt.figure()
-        plt.xscale('log')
-        plt.plot(lrs[10:-5], losses[10:-5])
-        plt.savefig(join(self.output_folder, "lr_finder.png"))
-        plt.close()
-        return log_lrs, losses
+    #     import matplotlib.pyplot as plt
+    #     lrs = [10 ** i for i in log_lrs]
+    #     fig = plt.figure()
+    #     plt.xscale('log')
+    #     plt.plot(lrs[10:-5], losses[10:-5])
+    #     plt.savefig(join(self.output_folder, "lr_finder.png"))
+    #     plt.close()
+    #     return log_lrs, losses

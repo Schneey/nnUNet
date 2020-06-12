@@ -157,6 +157,7 @@ def verify_dataset_integrity(folder):
         print("Labels OK")
 
     # check test set, but only if there actually is a test set
+    print(expected_test_identifiers)
     if len(expected_test_identifiers) > 0:
         print("Verifying test set")
         nii_files_in_imagesTs = subfiles((join(folder, "imagesTs")), suffix=".nii.gz", join=False)

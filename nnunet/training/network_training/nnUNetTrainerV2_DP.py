@@ -19,6 +19,8 @@ from batchgenerators.utilities.file_and_folder_operations import *
 from nnunet.network_architecture.generic_UNet_DP import Generic_UNet_DP
 from nnunet.training.data_augmentation.default_data_augmentation import get_moreDA_augmentation
 from nnunet.training.network_training.nnUNetTrainerV2 import nnUNetTrainerV2
+from nnunet.network_architecture.nas_UNet import Nas_UNet
+from nnunet.network_architecture.architect import Architect
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
 from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
@@ -36,11 +38,11 @@ except ImportError:
 
 class nnUNetTrainerV2_DP(nnUNetTrainerV2):
     def __init__(self, plans_file, fold, output_folder=None, dataset_directory=None, batch_dice=True, stage=None,
-                 unpack_data=True, deterministic=True, num_gpus=1, distribute_batch_size=False, fp16=False):
+                 unpack_data=True, deterministic=True, num_gpus=1, distribute_batch_size=False, fp16=False,net=None):
         super(nnUNetTrainerV2_DP, self).__init__(plans_file, fold, output_folder, dataset_directory, batch_dice, stage,
-                                                unpack_data, deterministic, fp16)
+                                                unpack_data, deterministic, fp16,net)
         self.init_args = (plans_file, fold, output_folder, dataset_directory, batch_dice, stage, unpack_data,
-                          deterministic, num_gpus, distribute_batch_size, fp16)
+                          deterministic, num_gpus, distribute_batch_size, fp16,net)
         self.num_gpus = num_gpus
         self.distribute_batch_size = distribute_batch_size
         self.dice_smooth = 1e-5
@@ -143,11 +145,20 @@ class nnUNetTrainerV2_DP(nnUNetTrainerV2):
         dropout_op_kwargs = {'p': 0, 'inplace': True}
         net_nonlin = nn.LeakyReLU
         net_nonlin_kwargs = {'negative_slope': 1e-2, 'inplace': True}
-        self.network = Generic_UNet_DP(self.num_input_channels, self.base_num_features, self.num_classes,
-                                    len(self.net_num_pool_op_kernel_sizes),
-                                    self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs,
-                                    net_nonlin, net_nonlin_kwargs, True, False, InitWeights_He(1e-2),
-                                    self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
+        if self.net=='3d_nas':
+            self.network=Nas_UNet(self.num_input_channels, self.base_num_features, self.num_classes,
+                                        len(self.net_num_pool_op_kernel_sizes),
+                                        self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op,
+                                        dropout_op_kwargs,
+                                        net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
+                                        self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
+            self.architect = Architect(self.network, self.loss)
+        else:
+            self.network = Generic_UNet_DP(self.num_input_channels, self.base_num_features, self.num_classes,
+                                        len(self.net_num_pool_op_kernel_sizes),
+                                        self.conv_per_stage, 2, conv_op, norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs,
+                                        net_nonlin, net_nonlin_kwargs, True, False, InitWeights_He(1e-2),
+                                        self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True)
         if torch.cuda.is_available():
             self.network.cuda()
         self.network.inference_apply_nonlin = softmax_helper
@@ -201,6 +212,86 @@ class nnUNetTrainerV2_DP(nnUNetTrainerV2):
             ces, tps, fps, fns = ret
 
         del data, target
+
+        # we now need to effectively reimplement the loss
+        loss = None
+        for i in range(len(ces)):
+            if not self.dice_do_BG:
+                tp = tps[i][:, 1:]
+                fp = fps[i][:, 1:]
+                fn = fns[i][:, 1:]
+            else:
+                tp = tps[i]
+                fp = fps[i]
+                fn = fns[i]
+
+            if self.batch_dice:
+                tp = tp.sum(0)
+                fp = fp.sum(0)
+                fn = fn.sum(0)
+            else:
+                pass
+
+            nominator = 2 * tp + self.dice_smooth
+            denominator = 2 * tp + fp + fn + self.dice_smooth
+
+            dice_loss = (- nominator / denominator).mean()
+            if loss is None:
+                loss = self.loss_weights[i] * (ces[i].mean() + dice_loss)
+            else:
+                loss += self.loss_weights[i] * (ces[i].mean() + dice_loss)
+        ###########
+
+        if do_backprop:
+            if not self.fp16 or amp is None or not torch.cuda.is_available():
+                loss.backward()
+            else:
+                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            _ = clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
+        return loss.detach().cpu().numpy()
+
+
+def run_iteration_nas(self,tr_data_generator, val_data_generator,do_backprop=True, run_online_evaluation=False):
+        tr_data_dict = next(tr_data_generator)
+        tr_data = tr_data_dict['data']
+        tr_target = tr_data_dict['target']
+        
+        val_data_dict = next(val_data_generator)
+        val_data = val_data_dict['data']
+        val_target = val_data_dict['target']
+
+        tr_data = maybe_to_torch(tr_data)
+        tr_target = maybe_to_torch(tr_target)
+        val_data = maybe_to_torch(val_data)
+        val_target = maybe_to_torch(val_target)
+        if torch.cuda.is_available():
+            tr_data = to_cuda(tr_data)
+            tr_target = to_cuda(tr_target)
+            val_target = to_cuda(val_target)
+            val_data = to_cuda(val_data)
+        self.architect.step(tr_data, tr_target, val_data, val_target, self.lr, self.optimizer,unrolled=False)
+        
+        del val_data 
+        del val_target
+        self.optimizer.zero_grad()
+
+        ###############
+        ret = self.network(tr_data, tr_target, return_hard_tp_fp_fn=run_online_evaluation)
+        if run_online_evaluation:
+            ces, tps, fps, fns, tp_hard, fp_hard, fn_hard = ret
+            tp_hard = tp_hard.detach().cpu().numpy().mean(0)
+            fp_hard = fp_hard.detach().cpu().numpy().mean(0)
+            fn_hard = fn_hard.detach().cpu().numpy().mean(0)
+            self.online_eval_foreground_dc.append(list((2 * tp_hard) / (2 * tp_hard + fp_hard + fn_hard + 1e-8)))
+            self.online_eval_tp.append(list(tp_hard))
+            self.online_eval_fp.append(list(fp_hard))
+            self.online_eval_fn.append(list(fn_hard))
+        else:
+            ces, tps, fps, fns = ret
+
+        del tr_data, tr_target
 
         # we now need to effectively reimplement the loss
         loss = None
